@@ -35,4 +35,5 @@ jobs:
       - run: python3 .github/scripts/agent_approval.py
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          DECISION_JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}

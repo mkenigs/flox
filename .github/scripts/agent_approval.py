@@ -353,26 +353,30 @@ def publish(repo, number, head, slug, conclusion, reason):
         ),
         None,
     )
-    output = {
-        "title": {
-            "neutral": "Awaiting owner approval",
-            "success": "Owner review satisfied",
-            "failure": "Unable to evaluate owner review",
-        }[conclusion],
-        "summary": f"PR #{number} at `{head}`\n\n{reason}",
-    }
+
+    def summary(job_url):
+        return f"PR #{number} at `{head}`\n\n{reason}\n\n[Open the decision job log]({job_url})"
+
+    # Keep the link to the job that established this decision on repeated runs.
     if (
         existing
         and existing["conclusion"] == conclusion
-        and existing["output"]["summary"] == output["summary"]
+        and existing["output"]["summary"] == summary(existing["details_url"])
     ):
         return
-    run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}"
+    job_url = os.environ["DECISION_JOB_URL"]
     payload = {
         "status": "completed",
         "conclusion": conclusion,
-        "output": output,
-        "details_url": run_url,
+        "output": {
+            "title": {
+                "neutral": "Awaiting owner approval",
+                "success": "Owner review satisfied",
+                "failure": "Unable to evaluate owner review",
+            }[conclusion],
+            "summary": summary(job_url),
+        },
+        "details_url": job_url,
     }
     if existing:
         api(f"{repo}/check-runs/{existing['id']}", method="PATCH", payload=payload)
