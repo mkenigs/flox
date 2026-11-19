@@ -1,0 +1,49 @@
+name: Flox agent approval
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited, closed, ready_for_review, converted_to_draft]
+  issue_comment:
+    types: [created, edited, deleted]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Claude Code Review]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    if: |
+      (github.ref == 'refs/heads/main' || github.event_name == 'merge_group') &&
+      (github.event_name != 'issue_comment' || (github.event.issue.pull_request &&
+        ((github.event.comment.user.type == 'User' &&
+          (contains(github.event.comment.body, '+1 ') || contains(github.event.changes.body.from, '+1 '))) ||
+         (github.event.action != 'created' && github.event.comment.user.type == 'Bot'))))
+    # Each run reads current GitHub state for all open PRs, so a newer pending
+    # run also covers events coalesced while another reconciliation is running.
+    concurrency:
+      group: flox-agent-approval
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.AGENT_REVIEW_APP_ID }}
+          private-key: ${{ secrets.AGENT_REVIEW_PRIVATE_KEY }}
+      - run: python3 .github/scripts/agent_approval.py
+        env:
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}

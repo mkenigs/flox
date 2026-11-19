@@ -593,3 +593,36 @@ sure to run all tests before creating a mergeable PR (See [above](#testing)).
 Because the merge commit takes its message from the pull request title, that
 title must follow the [conventional commits](#commits) format just like an
 individual commit — otherwise the merge fails validation.
+
+## Testing agent review on this fork
+
+The test owner is `@mkenigs` for every path. The approval app reads
+[the fork's policy](.github/flox-bot-codeowners) from `main`. Both the head
+and base of the PR for the Claude test must be in `mkenigs/flox`.
+
+1. Enable Actions on the fork's Actions tab. Install the
+   [Claude GitHub App](https://github.com/apps/claude) on this fork and set
+   the Actions repository secret `CLAUDE_CODE_OAUTH_TOKEN` for the reviewer.
+2. Register a dedicated approval app under your GitHub account and install
+   it on `mkenigs/flox`. Disable its webhook. Grant repository **Contents**
+   and **Actions** read, and **Pull requests** and **Commit statuses** write.
+   Generate an app private key.
+3. Under Settings → Secrets and variables → Actions, add
+   `AGENT_REVIEW_PRIVATE_KEY` as a repository secret and `AGENT_REVIEW_APP_ID`
+   as a repository variable.
+4. Land the setup on the fork's `main`. Open a non-draft PR against that
+   branch as `mkenigs` with a small documentation correction. After Claude
+   finishes, wait for the approval app's assessment comment. On a low-risk
+   assessment with at most minor findings, check that **Flox owner review**
+   is failing. Copy the `+1 RUN_ID/ATTEMPT` command from the assessment into
+   a new PR comment. Posting the comment triggers the check. Expect an
+   approving review from the dedicated app and a successful status on the PR head.
+   The endorsement itself records positive feedback. To disagree, comment
+   `-1 RUN_ID/ATTEMPT` with your reasoning. Reply to inline findings in their threads.
+5. Delete the endorsement comment. Its deletion triggers a new check and the
+   status should fail. Push another change and check that the old command cannot approve the
+   new head. To test independent approval, have another account open a PR to
+   the fork and approve it as `mkenigs`.
+
+Both paths can be observed through the PR status before configuring any
+branch protection.
