@@ -295,13 +295,12 @@ class EvidenceTest(unittest.TestCase):
             else:
                 checks.append({**payload, "id": 7, "app": {"slug": "app"}})
 
-        env = {
-            "GITHUB_REPOSITORY": "org/repo",
-            "GITHUB_RUN_ID": "11",
-            "GITHUB_RUN_ATTEMPT": "1",
-            "GITHUB_SERVER_URL": "https://github.com",
-        }
-        with patch.dict(os.environ, env), patch.object(gate, "api", side_effect=api):
+        first_job = "https://github.com/org/repo/actions/runs/11/job/101"
+        next_job = "https://github.com/org/repo/actions/runs/11/job/102"
+        with (
+            patch.dict(os.environ, DECISION_JOB_URL=first_job),
+            patch.object(gate, "api", side_effect=api),
+        ):
             args = ("repos/org/repo", 1, "head", "app")
             checks.extend(
                 [
@@ -310,6 +309,7 @@ class EvidenceTest(unittest.TestCase):
                 ]
             )
             gate.publish(*args, "neutral", "Awaiting approval")
+            os.environ["DECISION_JOB_URL"] = next_job
             gate.publish(*args, "neutral", "Awaiting approval")
             gate.publish(*args, "success", "Owner approved")
         self.assertEqual(
@@ -318,10 +318,24 @@ class EvidenceTest(unittest.TestCase):
         )
         self.assertEqual(writes[0][1]["conclusion"], "neutral")
         self.assertEqual(writes[1][1]["conclusion"], "success")
-        self.assertEqual(
-            writes[1][1]["details_url"],
-            "https://github.com/org/repo/actions/runs/11/attempts/1",
+        for (_, payload), job in zip(writes, (first_job, next_job), strict=True):
+            self.assertEqual(payload["details_url"], job)
+            self.assertIn(
+                f"[Open the decision job log]({job})", payload["output"]["summary"]
+            )
+
+        # Existing checks from before job links were added are updated in place.
+        checks[-1]["output"]["summary"] = "PR #1 at `head`\n\nOwner approved"
+        checks[-1]["details_url"] = (
+            "https://github.com/org/repo/actions/runs/11/attempts/1"
         )
+        with (
+            patch.dict(os.environ, DECISION_JOB_URL=next_job),
+            patch.object(gate, "api", side_effect=api),
+        ):
+            gate.publish(*args, "success", "Owner approved")
+        self.assertEqual(writes[-1][0], "repos/org/repo/check-runs/7")
+        self.assertEqual(checks[-1]["details_url"], next_job)
 
 
 if __name__ == "__main__":
