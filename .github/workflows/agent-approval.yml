@@ -5,11 +5,6 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, edited, closed, ready_for_review, converted_to_draft]
-  issue_comment:
-    types: [created, edited, deleted]
-  merge_group:
-    branches: [main]
-    types: [checks_requested]
   workflow_dispatch:
   workflow_run:
     workflows: [Claude Code Review]
@@ -20,12 +15,7 @@ permissions:
 
 jobs:
   reconcile:
-    if: |
-      (github.ref == 'refs/heads/main' || github.event_name == 'merge_group') &&
-      (github.event_name != 'issue_comment' || (github.event.issue.pull_request &&
-        ((github.event.comment.user.type == 'User' &&
-          (contains(github.event.comment.body, '+1 ') || contains(github.event.changes.body.from, '+1 '))) ||
-         (github.event.action != 'created' && github.event.comment.user.type == 'Bot'))))
+    if: github.ref == 'refs/heads/main'
     # Each run reads current GitHub state for all open PRs, so a newer pending
     # run also covers events coalesced while another reconciliation is running.
     concurrency:
@@ -44,6 +34,5 @@ jobs:
           private-key: ${{ secrets.AGENT_REVIEW_PRIVATE_KEY }}
       - run: python3 .github/scripts/agent_approval.py
         env:
-          OWNER_TYPE: ${{ github.event.repository.owner.type }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}

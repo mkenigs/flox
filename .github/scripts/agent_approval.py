@@ -7,15 +7,18 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import zipfile
 from pathlib import Path
 
-CONTEXT = "Flox owner review"
+CHECK_NAME = "Flox agent review decision"
 POLICY = Path(".github/flox-bot-codeowners")
 
 
-def api(path, *, payload=None, paginate=False):
+def api(path, *, payload=None, paginate=False, method=None):
     args = ["gh", "api", path]
+    if method:
+        args.extend(["--method", method])
     if paginate:
         args.extend(["--paginate", "--slurp"])
     if payload is not None:
@@ -25,8 +28,10 @@ def api(path, *, payload=None, paginate=False):
         input=json.dumps(payload) if payload is not None else None,
         capture_output=True,
         text=True,
-        check=True,
     )
+    if result.returncode:
+        print(result.stderr.rstrip(), file=sys.stderr)
+        result.check_returncode()
     return json.loads(result.stdout)
 
 
@@ -95,7 +100,7 @@ def review_votes(reviews, head):
     )
 
 
-def assessment(repo, number, head, base, bot):
+def assessment(repo, number, head, base, bot, anchor, comments):
     runs = api(
         f"{repo}/actions/workflows/claude-review.yml/runs"
         f"?head_sha={head}&event=pull_request&per_page=100"
@@ -155,42 +160,48 @@ def assessment(repo, number, head, base, bot):
         or not 0 < len(reason.strip()) <= 2000
     ):
         raise ValueError("Invalid assessment")
-    assessment_ref = f"{run['id']}/{run['run_attempt']}"
-    command = f"+1 {assessment_ref}"
     body = (
         f"**Claude risk assessment · {risk}**\n\n{reason}\n\nHighest finding severity: {severity}.\n\n"
-        f"To endorse this assessment, post a PR comment containing only `{command}`. "
-        f"If you disagree, comment `-1 {assessment_ref}` and explain why.\n\n"
-        f"Reviewed {head} · [review run]({run['html_url']}/attempts/{run['run_attempt']})"
+        f"Reviewed {head} · [review run {run['id']}, attempt {run['run_attempt']}]"
+        f"({run['html_url']}/attempts/{run['run_attempt']})\n\n"
+        "You can add your reasoning on the second line.\n\n"
+        "Reply in this thread with `+1` to agree or `-1` to disagree."
     )
-    path = f"{repo}/issues/{number}/comments"
-    comments = pages(path)
-    comment = next(
+    root = next(
         (
             c
             for c in comments
             if c["user"]["login"] == bot
+            and not c.get("in_reply_to_id")
+            and c["original_commit_id"] == head
             and c["body"] == body
-            and c["updated_at"] == c["created_at"]
+            and c["created_at"] == c["updated_at"]
         ),
         None,
     )
-    if not comment:
-        api(path, payload={"body": body})
+    if root is None:
+        api(
+            f"{repo}/pulls/{number}/comments",
+            payload={
+                "commit_id": head,
+                "path": anchor,
+                "subject_type": "file",
+                "body": body,
+            },
+        )
         return risk, severity, set()
 
-    endorsers = {
-        c["user"]["login"]
-        for c in comments
-        if c["user"]["type"] == "User"
-        and c["body"].strip() == command
-        and c["id"] > comment["id"]
-        and c["updated_at"] == c["created_at"]
-    }
-    return risk, severity, endorsers
+    votes = {}
+    for reply in sorted(comments, key=lambda c: c["id"]):
+        if reply.get("in_reply_to_id") != root["id"] or reply["user"]["type"] != "User":
+            continue
+        lines = reply["body"].strip().splitlines()
+        if lines and lines[0].strip() in ("+1", "-1"):
+            votes[reply["user"]["login"]] = lines[0].strip()
+    return risk, severity, {login for login, vote in votes.items() if vote == "+1"}
 
 
-def evaluate(repo, pr, rules, bot):
+def evaluate(repo, pr, rules, bot, reviews):
     number = pr["number"]
     head = pr["head"]["sha"]
     author = pr["user"]["login"]
@@ -199,7 +210,7 @@ def evaluate(repo, pr, rules, bot):
         return False, "Draft pull request"
     files = pages(f"{path}/files?per_page=100")
     if len(files) != pr["changed_files"]:
-        return False, "Incomplete file list"
+        raise ValueError("Incomplete changed file list")
     paths = {f[k] for f in files for k in ("filename", "previous_filename") if k in f}
     groups = coverage(paths, rules)
 
@@ -209,32 +220,62 @@ def evaluate(repo, pr, rules, bot):
         return {owner}
 
     owners = [set().union(*(logins(owner) for owner in group)) for group in groups]
-    reviews = pages(f"{path}/reviews?per_page=100")
-    approvals, objections = review_votes(reviews, head)
-    if all(group & (approvals - {author}) for group in owners):
-        return True, "Approved by owners of all changed paths"
+    same_repo = (pr["head"]["repo"] or {}).get("full_name") == repo.removeprefix(
+        "repos/"
+    )
+    result = None
+    comments = []
+    if same_repo:
+        comments = pages(f"{path}/comments?per_page=100")
+        # GitHub review threads need a diff anchor, even for a PR-wide assessment.
+        anchor = next(
+            (f["filename"] for f in files if f.get("status") != "removed"),
+            files[0]["filename"],
+        )
+        result = assessment(
+            repo, number, head, pr["base"]["sha"], bot, anchor, comments
+        )
 
+    approvals, objections = review_votes(reviews, head)
+    print(
+        f"PR #{number}: owner groups {sorted(sorted(group) for group in groups)}, "
+        f"current human approvals {sorted(approvals)}, owner objections {sorted(objections & set.union(*owners))}"
+    )
+    if result is not None:
+        risk, severity, endorsers = result
+        print(
+            f"PR #{number}: risk {risk}, highest finding {severity}, endorsements {sorted(endorsers)}"
+        )
+    if all(group & (approvals - {author}) for group in owners):
+        return True, "Independent owners approved all changed paths"
     if objections & set.union(*owners):
         return False, "An owner requested changes"
-    if (
-        pr["head"]["repo"] is None
-        or pr["head"]["repo"]["full_name"] != repo.removeprefix("repos/")
-        or any(
-            p.startswith((".github/", ".agents/", ".claude/"))
-            or p.split("/")[-1] == "AGENTS.md"
-            for p in paths
+    if not same_repo:
+        return False, "Independent owner review required for a fork PR"
+    protected = sorted(
+        p
+        for p in paths
+        if p.startswith((".github/", ".agents/", ".claude/"))
+        or p.split("/")[-1] == "AGENTS.md"
+    )
+    if protected:
+        return False, f"Independent owner review required for `{protected[0]}`"
+    if author not in set.intersection(*owners):
+        return (
+            False,
+            "Independent owner review required because the author does not own every changed path",
         )
-    ):
-        return False, "Independent owner review required"
-    result = assessment(repo, number, head, pr["base"]["sha"], bot)
-    if author not in set.intersection(*owners) or result is None:
-        return False, "Awaiting independent approval or eligible owner assessment"
+    if result is None:
+        return False, "Awaiting a completed Claude assessment for the current changes"
     risk, severity, endorsers = result
     if risk != "low" or severity not in ("none", "minor"):
-        return False, "Independent owner review required by assessment"
+        return (
+            False,
+            f"Independent owner review required (risk: {risk}, highest finding: {severity})",
+        )
     if not endorsers.intersection(set.union(*owners)):
-        return False, "Awaiting an owner's endorsement comment on the risk assessment"
-    for finding in pages(f"{path}/comments?per_page=100"):
+        return False, "Awaiting an owner's +1 reply in the risk assessment thread"
+    for finding in comments:
         if (
             finding["user"]["login"] == "claude[bot]"
             and finding["original_commit_id"] == head
@@ -242,13 +283,26 @@ def evaluate(repo, pr, rules, bot):
             and not finding["body"].startswith("**Minor**")
         ):
             return False, "Blocking or unclassified inline Claude finding"
-    if any(
-        r["user"]["login"] == bot
+    dismissed = {
+        str(r["id"])
+        for r in reviews
+        if r["user"]["login"] == bot
         and r["state"] == "DISMISSED"
         and r["commit_id"] == head
-        for r in reviews
-    ):
-        return False, "Bot approval dismissed; independent owner review required"
+    }
+    if dismissed:
+        # The app can restore its own withdrawn approval after a fresh endorsement.
+        withdrawn = {
+            str(event["dismissed_review"]["review_id"])
+            for event in pages(f"{repo}/issues/{number}/timeline?per_page=100")
+            if event["event"] == "review_dismissed"
+            and (event.get("actor") or {}).get("login") == bot
+        }
+        if dismissed - withdrawn:
+            return (
+                False,
+                "Bot approval dismissed by a reviewer; independent owner review required",
+            )
     if not any(
         r["user"]["login"] == bot
         and r["state"] == "APPROVED"
@@ -266,88 +320,126 @@ def evaluate(repo, pr, rules, bot):
     return True, "Owner-authored, low risk and endorsed"
 
 
-def publish(repo, sha, bot, allowed, description):
-    state = "success" if allowed else "failure"
-    statuses = pages(f"{repo}/commits/{sha}/statuses?per_page=100")
-    last = next((s for s in statuses if s["context"] == CONTEXT), None)
-    if last and (last["creator"]["login"], last["state"], last["description"]) == (
-        bot,
-        state,
-        description,
+def withdraw_approvals(path, reviews, bot, head, allowed, reason):
+    for review in reviews:
+        if review["user"]["login"] != bot or review["state"] != "APPROVED":
+            continue
+        if review["commit_id"] == head and allowed:
+            continue
+        # A push can race reconciliation. Leave the new head to its own run.
+        if api(path)["head"]["sha"] != head:
+            return
+        message = (
+            reason
+            if review["commit_id"] == head
+            else "A new commit needs fresh review."
+        )
+        api(
+            f"{path}/reviews/{review['id']}/dismissals",
+            method="PUT",
+            payload={"message": message},
+        )
+
+
+def publish(repo, number, head, slug, conclusion, reason):
+    external_id = f"flox-review-pr-{number}"
+    url = f"{repo}/commits/{head}/check-runs?check_name={urllib.parse.quote(CHECK_NAME)}&filter=all&per_page=100"
+    existing = next(
+        (
+            check
+            for page in api(url, paginate=True)
+            for check in page["check_runs"]
+            if check["app"]["slug"] == slug and check["external_id"] == external_id
+        ),
+        None,
+    )
+    output = {
+        "title": {
+            "neutral": "Awaiting owner approval",
+            "success": "Owner review satisfied",
+            "failure": "Unable to evaluate owner review",
+        }[conclusion],
+        "summary": f"PR #{number} at `{head}`\n\n{reason}",
+    }
+    if (
+        existing
+        and existing["conclusion"] == conclusion
+        and existing["output"]["summary"] == output["summary"]
     ):
         return
-    api(
-        f"{repo}/statuses/{sha}",
-        payload={"state": state, "context": CONTEXT, "description": description},
-    )
-
-
-def open_entries(org, name):
-    # Query the queue before evaluating evidence. A subsequent enqueue or push
-    # must wait for a new pass on its own speculative commit.
-    query = """query($org:String!, $name:String!, $endCursor:String, $withQueue:Boolean!) {
-      repository(owner:$org, name:$name) {
-        pullRequests(first:100, after:$endCursor, states:OPEN, baseRefName:"main") {
-          nodes { number headRefOid mergeQueueEntry @include(if:$withQueue) { headCommit { oid } } }
-          pageInfo { hasNextPage endCursor }
-        }
-      }
-    }"""
-    variables = {
-        "org": org,
-        "name": name,
-        "withQueue": os.environ["OWNER_TYPE"] == "Organization",
+    run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}"
+    payload = {
+        "status": "completed",
+        "conclusion": conclusion,
+        "output": output,
+        "details_url": run_url,
     }
-    while True:
-        response = api("graphql", payload={"query": query, "variables": variables})
-        connection = response["data"]["repository"]["pullRequests"]
-        yield from connection["nodes"]
-        if not connection["pageInfo"]["hasNextPage"]:
-            return
-        variables["endCursor"] = connection["pageInfo"]["endCursor"]
+    if existing:
+        api(f"{repo}/check-runs/{existing['id']}", method="PATCH", payload=payload)
+    else:
+        api(
+            f"{repo}/check-runs",
+            payload={
+                **payload,
+                "name": CHECK_NAME,
+                "head_sha": head,
+                "external_id": external_id,
+            },
+        )
 
 
 def main():
     org, name = os.environ["GITHUB_REPOSITORY"].split("/")
     repo = f"repos/{org}/{name}"
-    bot = os.environ["APP_SLUG"] + "[bot]"
+    slug = os.environ["APP_SLUG"]
+    bot = slug + "[bot]"
     rules = owner_rules(POLICY.read_text(), org)
-    decisions = {}
     failed = False
-    for entry in list(open_entries(org, name)):
-        head = entry["headRefOid"]
+    for entry in pages(f"{repo}/pulls?state=open&base=main&per_page=100"):
+        number, head = entry["number"], entry["head"]["sha"]
+        path = f"{repo}/pulls/{number}"
+        reviews = None
         try:
-            pr = api(f"{repo}/pulls/{entry['number']}")
+            pr = api(path)
             if (
                 pr["state"] != "open"
                 or pr["head"]["sha"] != head
                 or pr["base"]["ref"] != "main"
             ):
                 continue
-            decision = evaluate(repo, pr, rules, bot)
+            reviews = pages(f"{path}/reviews?per_page=100")
+            allowed, reason = evaluate(repo, pr, rules, bot, reviews)
+            conclusion = "success" if allowed else "neutral"
         except (
             OSError,
-            subprocess.CalledProcessError,
             ValueError,
             KeyError,
             TypeError,
+            subprocess.CalledProcessError,
             zipfile.BadZipFile,
         ) as error:
-            print(f"PR #{entry['number']}: {error}", file=sys.stderr)
-            decision = False, "Unable to verify owner review"
+            print(f"PR #{number}: {error}", file=sys.stderr)
+            reason = f"Could not verify approval ({type(error).__name__}). See the reconciliation log."
+            conclusion = "failure"
             failed = True
-        commits = [head]
-        queued = entry.get("mergeQueueEntry")
-        if queued and queued["headCommit"]:
-            commits.append(queued["headCommit"]["oid"])
-        for sha in commits:
-            if sha not in decisions or not decision[0]:
-                decisions[sha] = decision
-    for sha, decision in decisions.items():
         try:
-            publish(repo, sha, bot, *decision)
+            if reviews is None:
+                reviews = pages(f"{path}/reviews?per_page=100")
+            withdraw_approvals(
+                path, reviews, bot, head, conclusion == "success", reason
+            )
         except subprocess.CalledProcessError as error:
-            print(f"Could not publish {sha}: {error}", file=sys.stderr)
+            print(f"PR #{number}: {error}", file=sys.stderr)
+            conclusion, reason = (
+                "failure",
+                "Could not withdraw the bot approval. See the reconciliation log.",
+            )
+            failed = True
+        print(f"PR #{number} {head}: {conclusion} — {reason}")
+        try:
+            publish(repo, number, head, slug, conclusion, reason)
+        except subprocess.CalledProcessError as error:
+            print(f"Could not publish check for PR #{number}: {error}", file=sys.stderr)
             failed = True
     return int(failed)
 

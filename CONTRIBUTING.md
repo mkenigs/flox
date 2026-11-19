@@ -605,24 +605,30 @@ and base of the PR for the Claude test must be in `mkenigs/flox`.
    the Actions repository secret `CLAUDE_CODE_OAUTH_TOKEN` for the reviewer.
 2. Register a dedicated approval app under your GitHub account and install
    it on `mkenigs/flox`. Disable its webhook. Grant repository **Contents**
-   and **Actions** read, and **Pull requests** and **Commit statuses** write.
+   and **Actions** read, and **Pull requests** and **Checks** write.
    Generate an app private key.
 3. Under Settings → Secrets and variables → Actions, add
    `AGENT_REVIEW_PRIVATE_KEY` as a repository secret and `AGENT_REVIEW_APP_ID`
    as a repository variable.
-4. Land the setup on the fork's `main`. Open a non-draft PR against that
-   branch as `mkenigs` with a small documentation correction. After Claude
-   finishes, wait for the approval app's assessment comment. On a low-risk
-   assessment with at most minor findings, check that **Flox owner review**
-   is failing. Copy the `+1 RUN_ID/ATTEMPT` command from the assessment into
-   a new PR comment. Posting the comment triggers the check. Expect an
-   approving review from the dedicated app and a successful status on the PR head.
-   The endorsement itself records positive feedback. To disagree, comment
-   `-1 RUN_ID/ATTEMPT` with your reasoning. Reply to inline findings in their threads.
-5. Delete the endorsement comment. Its deletion triggers a new check and the
-   status should fail. Push another change and check that the old command cannot approve the
-   new head. To test independent approval, have another account open a PR to
-   the fork and approve it as `mkenigs`.
+4. Land the setup on the fork's `main`. Open a non-draft documentation PR
+   as `mkenigs`. The approval app posts Claude's assessment in a file-level
+   review thread. Reply in that thread with `+1` to agree or `-1` to disagree.
+   You can add reasoning on the next line. The latest vote from each owner
+   in the current assessment thread counts. A low-risk assessment with at
+   most minor findings and an owner's endorsement qualifies for bot approval.
+   Workflow or agent policy changes always need independent owner review.
+5. Open **Flox agent review decision** under **Checks**. Its summary explains
+   the decision and links to the workflow log. Waiting for a review or an
+   endorsement produces a neutral check. An evaluation error fails the check.
+6. Delete the sole endorsement or reply `-1`. The app should dismiss its own
+   approval. Reply `+1` to restore it. Push a new commit to test that replies
+   on the old assessment cannot approve the new changes. To test independent
+   approval, approve another author's PR as `mkenigs`.
 
-Both paths can be observed through the PR status before configuring any
-branch protection.
+For merge enforcement, configure a native requirement of one approving review
+and dismiss stale approvals on new commits. Verify that GitHub counts the
+app's approval and permits it to dismiss its own review under the branch's
+review-dismissal rules. Leave the diagnostic check optional and remove any
+old **Flox owner review** required status after configuring the review rule.
+GitHub's approval count accepts any eligible reviewer. The custom ownership
+file only governs the app's decision.
