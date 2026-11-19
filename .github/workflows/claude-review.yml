@@ -1,33 +1,31 @@
 name: Claude Code Review
 
 on:
-  # Deliberately no `synchronize`: automated review is a checkpoint for when a
-  # PR arrives ready for eyes, not a gate on every push. It runs on `opened`
-  # for a non-draft PR and on `ready_for_review` when a draft is promoted.
-  #
-  # An on-demand re-review trigger is deliberately out of scope here; see the
-  # follow-up PR. `@claude` (claude-mention.yml) is NOT a substitute for this
-  # reviewer — it is a general-purpose interactive agent on a different model,
-  # effort, harness and prompt, with no inline-comment tooling. Use it for
-  # questions and scoped asks, not as the re-review path.
   pull_request:
-    types: [opened, ready_for_review]
-
-# One review at a time per PR, and never interrupt one that is already running:
-# the review posts inline comments as it goes, so cancelling mid-flight leaves a
-# half-posted review behind — findings with no summary and no signal that
-# anything was dropped. A second trigger waits instead. Keyed by PR number
-# rather than head ref, because a branch name is not unique to a pull request
-# but the review's unit of work is exactly one.
-concurrency:
-  group: claude-review-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+    types: [opened, reopened, ready_for_review, synchronize]
+  # Completing this workflow wakes the approval check for human reviews,
+  # including reviews on fork PRs where repository secrets are unavailable.
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
 
 jobs:
   review:
     # Skip on fork PRs: the review needs CLAUDE_CODE_OAUTH_TOKEN, which isn't
     # available to pull_request runs from forks, so it only fails.
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: |
+      github.event_name == 'pull_request' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'synchronize' || github.base_ref == 'main')
+    # One review at a time per PR, and never interrupt one that is already running:
+    # the review posts inline comments as it goes, so cancelling mid-flight leaves a
+    # half-posted review behind — findings with no summary and no signal that
+    # anything was dropped. A second trigger waits instead. Keyed by PR number
+    # rather than head ref, because a branch name is not unique to a pull request
+    # but the review's unit of work is exactly one.
+    concurrency:
+      group: claude-review-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,9 +61,8 @@ jobs:
           claude_args: |
             --model opus
             --effort xhigh
+            --json-schema '{"type":"object","required":["risk","rationale","highest_severity"],"additionalProperties":false,"properties":{"risk":{"enum":["low","medium","high"]},"rationale":{"type":"string"},"highest_severity":{"enum":["none","minor","important","critical"]}}}'
             --dangerously-skip-permissions
-            # Trigger MCP installations. No actual effect on permissions since
-            # we're allowing all.
             --allowedTools "mcp__github_inline_comment__*,mcp__github_comment__*"
           plugins: 'superpowers@claude-plugins-official'
           track_progress: true
@@ -87,5 +84,25 @@ jobs:
               If there are no issues, say specifically what you reviewed and
               verified rather than a bare "no issues found".
             - Append this feedback request to each inline finding only:
-              "React with 👍 or 👎 if this was helpful or not to help build
-              an eval data set."
+              "Reply in this thread with +1 if this finding was helpful or -1 if it was unhelpful."
+
+            Apply AGENTS.md and each applicable skill explicitly. Start every
+            inline finding with exactly **Minor**, **Important** or **Critical**. Report the highest
+            severity across all findings in the structured result. Use none
+            only after completing the review without findings.
+            Use .agents/skills/assessing-pr-risk/SKILL.md for the risk and
+            rationale (at most 2000 characters). Include both in the tracking summary. Review the exact head ${{ github.event.pull_request.head.sha }}.
+
+      - name: Record completed assessment
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ASSESSMENT: ${{ steps.claude-review.outputs.structured_output }}
+        run: |
+          jq -e --arg base "$BASE_SHA" 'select(type == "object") + {base: $base}' <<< "$ASSESSMENT" > "$RUNNER_TEMP/assessment.json"
+          test -s "$RUNNER_TEMP/assessment.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: assessment-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/assessment.json
+          if-no-files-found: error
