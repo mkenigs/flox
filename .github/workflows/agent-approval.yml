@@ -2,20 +2,20 @@ name: Flox agent approval
 on:
   push:
     branches: [main]
-  pull_request_target:
-    branches: [main]
-    types: [opened, reopened, synchronize, edited, closed, ready_for_review, converted_to_draft]
   workflow_dispatch:
+  # Run on main so only the app's decision check is attached to the PR head.
   workflow_run:
     workflows: [Claude Code Review]
-    types: [completed]
+    types: [requested, completed]
 
 permissions:
   contents: read
 
 jobs:
   reconcile:
-    if: github.ref == 'refs/heads/main'
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (github.event.action != 'requested' || github.event.workflow_run.event == 'pull_request')
     # Each run reads current GitHub state for all open PRs, so a newer pending
     # run also covers events coalesced while another reconciliation is running.
     concurrency:
