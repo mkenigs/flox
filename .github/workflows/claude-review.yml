@@ -91,7 +91,38 @@ jobs:
             severity across all findings in the structured result. Use none
             only after completing the review without findings.
             Use .agents/skills/assessing-pr-risk/SKILL.md for the risk and
-            rationale (at most 2000 characters). Include both in the tracking summary. Review the exact head ${{ github.event.pull_request.head.sha }}.
+            rationale (at most 2000 characters). The approval app posts both in a dedicated
+            assessment thread for owner feedback. Review the exact head ${{ github.event.pull_request.head.sha }}.
+
+      - name: Diagnose Claude session failure
+        if: failure() && steps.claude-review.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        run: |
+          log_file="${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+          if [[ ! -s "$log_file" ]]; then
+            echo "Claude did not write an SDK execution log."
+            exit 0
+          fi
+          # The transcript can contain credentials and PR content. Print only
+          # typed SDK diagnostics from the runner-local file.
+          jq '
+            def error_hint:
+              if test("session limit|usage limit|rate.limit"; "i") then "usage limit"
+              elif test("invalid.{0,25}schema|schema.{0,25}invalid"; "i") then "invalid schema"
+              elif test("expired.{0,20}token|token.{0,20}expired"; "i") then "expired token"
+              else empty end;
+            {
+              result_hints: ([.[] | select(.type == "result" and .is_error) | .result | strings | error_hint] | unique),
+              http_status: ([.[] | select(.type == "result") | .api_error_status | numbers] | last),
+              assistant_errors: ([.[] | select(.type == "assistant") | .error |
+                select(IN("authentication_failed", "oauth_org_not_allowed", "billing_error",
+                          "rate_limit", "overloaded", "invalid_request", "model_not_found",
+                          "server_error", "unknown", "max_output_tokens"))] | unique),
+              retry_statuses: ([.[] | select(.type == "system" and .subtype == "api_retry") |
+                .error_status | numbers] | unique),
+              rate_limit_rejected: any(.[]; .type == "rate_limit_event" and .rate_limit_info.status == "rejected")
+            }' "$log_file"
 
       - name: Record completed assessment
         env:

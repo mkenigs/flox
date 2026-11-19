@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 import zipfile
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 import agent_approval as gate
 
@@ -54,7 +54,9 @@ class ApprovalTest(unittest.TestCase):
         return patcher.start()
 
     def allowed(self):
-        return gate.evaluate("repos/org/repo", self.pr, self.rules, "app[bot]")[0]
+        return gate.evaluate(
+            "repos/org/repo", self.pr, self.rules, "app[bot]", self.reviews
+        )[0]
 
     def test_rename_needs_owners_on_both_sides(self):
         self.files[0]["previous_filename"] = "schema/file"
@@ -112,6 +114,28 @@ class ApprovalTest(unittest.TestCase):
         self.assertFalse(self.allowed())
         self.api.assert_not_called()
 
+    def test_only_app_withdrawals_allow_reapproval(self):
+        self.reviews.append(dict(review("app[bot]", "DISMISSED", kind="Bot"), id=9))
+        event = {
+            "event": "review_dismissed",
+            "actor": {"login": "maintainer"},
+            "dismissed_review": {"review_id": 9},
+        }
+        with patch.object(
+            gate,
+            "pages",
+            side_effect=lambda path: (
+                [event]
+                if "/timeline?" in path
+                else self.files
+                if "/files?" in path
+                else []
+            ),
+        ):
+            self.assertFalse(self.allowed())
+            event["actor"]["login"] = "app[bot]"
+            self.assertTrue(self.allowed())
+
     def test_policy_edits_and_forks_need_independent_review(self):
         self.files[0]["filename"] = ".github/flox-bot-codeowners"
         self.assertFalse(self.allowed())
@@ -122,11 +146,11 @@ class ApprovalTest(unittest.TestCase):
         self.assertFalse(self.allowed())
         self.reviews.append(review("maintainer"))
         self.assertTrue(self.allowed())
-        self.assessment.assert_not_called()
+        self.assertEqual(self.assessment.call_count, 1)
 
 
 class EvidenceTest(unittest.TestCase):
-    def test_only_current_run_and_unedited_app_assessment_receive_endorsements(self):
+    def test_only_replies_to_current_unedited_assessment_receive_endorsements(self):
         base = "a" * 40
         result = {
             "risk": "low",
@@ -152,15 +176,16 @@ class EvidenceTest(unittest.TestCase):
         def api(path, *, payload=None):
             if "workflows/" in path:
                 return {"workflow_runs": [run]}
-            if path.endswith("/artifacts?name=assessment-1-2"):
+            if path.endswith(f"/artifacts?name=assessment-1-{run['run_attempt']}"):
                 return {"artifacts": [artifact]}
-            if payload and path.endswith("/issues/1/comments"):
+            if payload and path.endswith("/pulls/1/comments"):
                 comments.append(
                     {
                         "user": {"login": "app[bot]", "type": "Bot"},
                         "id": len(comments) + 1,
                         "created_at": "now",
                         "updated_at": "now",
+                        "original_commit_id": payload["commit_id"],
                         **payload,
                     }
                 )
@@ -168,7 +193,9 @@ class EvidenceTest(unittest.TestCase):
             self.fail(path)
 
         def read():
-            return gate.assessment("repos/org/repo", 1, "head", base, "app[bot]")
+            return gate.assessment(
+                "repos/org/repo", 1, "head", base, "app[bot]", "README.md", comments
+            )
 
         with (
             patch.object(gate, "api", side_effect=api),
@@ -178,21 +205,36 @@ class EvidenceTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(read(), ("low", "none", set()))
-            self.assertIn("`+1 7/2`", comments[0]["body"])
+            self.assertEqual(comments[0]["subject_type"], "file")
+            self.assertEqual(comments[0]["path"], "README.md")
+            self.assertIn(
+                "`+1` to agree or `-1` to disagree",
+                comments[0]["body"].splitlines()[-1],
+            )
             vote = {
                 "user": {"type": "User", "login": "owner"},
                 "id": 2,
-                "body": "+1 7/1",
+                "body": "+1",
+                "in_reply_to_id": 42,
                 "created_at": "now",
                 "updated_at": "now",
             }
             comments.append(vote)
             self.assertEqual(read(), ("low", "none", set()))
-            vote["body"] = "+1 7/2"
+            vote["in_reply_to_id"] = comments[0]["id"]
             self.assertEqual(read(), ("low", "none", {"owner"}))
-            vote["updated_at"] = "later"
+            disagreement = {**vote, "id": 3, "body": "-1\nNeeds a migration"}
+            comments.append(disagreement)
             self.assertEqual(read(), ("low", "none", set()))
-            vote["updated_at"] = "now"
+            comments.remove(disagreement)
+            self.assertEqual(read(), ("low", "none", {"owner"}))
+            run["run_attempt"] = 3
+            self.assertEqual(read(), ("low", "none", set()))
+            self.assertEqual(read(), ("low", "none", set()))
+            run["run_attempt"] = 2
+            vote["body"] = "-1"
+            self.assertEqual(read(), ("low", "none", set()))
+            vote["body"] = "+1"
             comments[0]["updated_at"] = "later"
             self.assertEqual(read(), ("low", "none", set()))
             self.assertEqual(read(), ("low", "none", set()))
@@ -202,34 +244,84 @@ class EvidenceTest(unittest.TestCase):
             run["pull_requests"][0]["head"]["sha"] = "old"
             self.assertIsNone(read())
 
-    def test_shared_head_requires_all_prs_and_queue_uses_its_own_commit(self):
-        entries = [
-            {"number": 1, "headRefOid": "head", "mergeQueueEntry": None},
-            {
-                "number": 2,
-                "headRefOid": "head",
-                "mergeQueueEntry": {"headCommit": {"oid": "queue"}},
-            },
+    def test_withdraw_only_bot_approvals(self):
+        reviews = [
+            dict(review("owner"), id=4),
+            dict(review("app[bot]", kind="Bot"), id=5),
+            dict(review("app[bot]", "COMMENTED", kind="Bot"), id=6),
         ]
-        pr = {"state": "open", "head": {"sha": "head"}, "base": {"ref": "main"}}
-        env = {"GITHUB_REPOSITORY": "flox/flox", "APP_SLUG": "app"}
-        with (
-            patch.dict(os.environ, env),
-            patch.object(gate, "open_entries", return_value=entries),
-            patch.object(gate, "api", return_value=pr),
-            patch.object(
-                gate, "evaluate", side_effect=[(False, "blocked"), (True, "approved")]
-            ),
-            patch.object(gate, "publish") as publish,
-        ):
-            self.assertEqual(gate.main(), 0)
+        reviews.append(dict(review("app[bot]", sha="old", kind="Bot"), id=7))
+        with patch.object(gate, "api", return_value={"head": {"sha": "head"}}) as api:
+            gate.withdraw_approvals(
+                "pulls/1", reviews, "app[bot]", "head", False, "Endorsement withdrawn"
+            )
+            writes = [c for c in api.call_args_list if c.kwargs.get("method") == "PUT"]
             self.assertEqual(
-                publish.call_args_list,
+                [(c.args[0], c.kwargs["payload"]["message"]) for c in writes],
                 [
-                    call("repos/flox/flox", "head", "app[bot]", False, "blocked"),
-                    call("repos/flox/flox", "queue", "app[bot]", True, "approved"),
+                    ("pulls/1/reviews/5/dismissals", "Endorsement withdrawn"),
+                    (
+                        "pulls/1/reviews/7/dismissals",
+                        "A new commit needs fresh review.",
+                    ),
                 ],
             )
+            api.reset_mock()
+            gate.withdraw_approvals(
+                "pulls/1", reviews, "app[bot]", "head", True, "Endorsed"
+            )
+            self.assertEqual(
+                [c.args[0] for c in api.call_args_list if c.kwargs.get("method")],
+                ["pulls/1/reviews/7/dismissals"],
+            )
+            api.reset_mock()
+            api.return_value = {"head": {"sha": "new-head"}}
+            gate.withdraw_approvals(
+                "pulls/1", reviews, "app[bot]", "head", False, "Waiting"
+            )
+            api.assert_called_once_with("pulls/1")
+
+    def test_decision_check_is_neutral_idempotent_and_updates_by_app_and_pr(self):
+        checks = []
+        writes = []
+
+        def api(path, **kwargs):
+            if kwargs.get("paginate"):
+                return [{"check_runs": checks}]
+            payload = kwargs["payload"]
+            writes.append((path, payload))
+            if kwargs.get("method") == "PATCH":
+                checks[-1].update(payload)
+            else:
+                checks.append({**payload, "id": 7, "app": {"slug": "app"}})
+
+        env = {
+            "GITHUB_REPOSITORY": "org/repo",
+            "GITHUB_RUN_ID": "11",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SERVER_URL": "https://github.com",
+        }
+        with patch.dict(os.environ, env), patch.object(gate, "api", side_effect=api):
+            args = ("repos/org/repo", 1, "head", "app")
+            checks.extend(
+                [
+                    {"app": {"slug": "other"}, "external_id": "flox-review-pr-1"},
+                    {"app": {"slug": "app"}, "external_id": "flox-review-pr-2"},
+                ]
+            )
+            gate.publish(*args, "neutral", "Awaiting approval")
+            gate.publish(*args, "neutral", "Awaiting approval")
+            gate.publish(*args, "success", "Owner approved")
+        self.assertEqual(
+            [path for path, _ in writes],
+            ["repos/org/repo/check-runs", "repos/org/repo/check-runs/7"],
+        )
+        self.assertEqual(writes[0][1]["conclusion"], "neutral")
+        self.assertEqual(writes[1][1]["conclusion"], "success")
+        self.assertEqual(
+            writes[1][1]["details_url"],
+            "https://github.com/org/repo/actions/runs/11/attempts/1",
+        )
 
 
 if __name__ == "__main__":
