@@ -112,7 +112,7 @@ $ flox init                        # Create an environment in your project
 $ flox install python3 nodejs      # Install packages (any combination of tools)
 ✔ 'python3', 'nodejs' installed to environment 'my-project'
 
-$ flox activate                    # Enter the environment
+$ flox activate                    # Enter the project environment
 flox [my-project] $ python3 --version
 Python 3.13.13
 flox [my-project] $ node --version
