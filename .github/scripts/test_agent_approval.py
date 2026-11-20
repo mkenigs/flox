@@ -281,6 +281,42 @@ class EvidenceTest(unittest.TestCase):
             )
             api.assert_called_once_with("pulls/1")
 
+    def test_renames_existing_endorsement_check_without_replacing_its_log(self):
+        job = "https://github.com/org/repo/actions/runs/11/job/101"
+        reason = gate.AWAITING_ENDORSEMENT
+        check = {
+            "id": 7,
+            "external_id": "flox-review-pr-1",
+            "app": {"slug": "app"},
+            "name": "Flox agent review decision",
+            "conclusion": "neutral",
+            "details_url": job,
+            "output": {
+                "title": "Awaiting owner approval",
+                "summary": f"PR #1 at `head`\n\n{reason}\n\n[Open the decision job log]({job})",
+            },
+        }
+        with patch.object(
+            gate, "api", side_effect=[[{"check_runs": [check]}], {}]
+        ) as api:
+            gate.publish("repos/org/repo", 1, "head", "app", "neutral", reason)
+        self.assertNotIn("check_name=", api.call_args_list[0].args[0])
+        self.assertEqual(api.call_args.args, ("repos/org/repo/check-runs/7",))
+        self.assertEqual(api.call_args.kwargs["method"], "PATCH")
+        self.assertEqual(
+            api.call_args.kwargs["payload"],
+            {
+                "name": "flox-review[bot] decision",
+                "status": "completed",
+                "conclusion": "neutral",
+                "output": {
+                    **check["output"],
+                    "title": "Awaiting author risk endorsement",
+                },
+                "details_url": job,
+            },
+        )
+
     def test_decision_check_is_neutral_idempotent_and_updates_by_app_and_pr(self):
         checks = []
         writes = []
@@ -317,6 +353,7 @@ class EvidenceTest(unittest.TestCase):
             ["repos/org/repo/check-runs", "repos/org/repo/check-runs/7"],
         )
         self.assertEqual(writes[0][1]["conclusion"], "neutral")
+        self.assertEqual(writes[0][1]["output"]["title"], "Awaiting owner approval")
         self.assertEqual(writes[1][1]["conclusion"], "success")
         for (_, payload), job in zip(writes, (first_job, next_job), strict=True):
             self.assertEqual(payload["details_url"], job)
