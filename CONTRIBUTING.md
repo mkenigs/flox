@@ -617,8 +617,9 @@ and base of the PR for the Claude test must be in `mkenigs/flox`.
    in the current assessment thread counts. A low-risk assessment with at
    most minor findings and an owner's endorsement qualifies for bot approval.
    Workflow or agent policy changes always need independent owner review.
-5. Open **flox-review[bot] decision** under **Checks**. Its summary explains
-   the decision and links to the workflow log. Waiting for a review or an
+5. Under **Checks**, open **Calculate flox-review[bot] decision** for the
+   Actions job log. Open **flox-review[bot] decision** for the current verdict
+   and a link to the job that established it. Waiting for a review or an
    endorsement produces a neutral check. An evaluation error fails the check.
 6. Delete the sole endorsement or reply `-1`. The app should dismiss its own
    approval. Reply `+1` to restore it. Push a new commit to test that replies
