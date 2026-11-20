@@ -7,11 +7,11 @@ import os
 import re
 import subprocess
 import sys
-import urllib.parse
 import zipfile
 from pathlib import Path
 
-CHECK_NAME = "Flox agent review decision"
+CHECK_NAME = "flox-review[bot] decision"
+AWAITING_ENDORSEMENT = "Awaiting an owner's +1 reply in the risk assessment thread"
 POLICY = Path(".github/flox-bot-codeowners")
 
 
@@ -274,7 +274,7 @@ def evaluate(repo, pr, rules, bot, reviews):
             f"Independent owner review required (risk: {risk}, highest finding: {severity})",
         )
     if not endorsers.intersection(set.union(*owners)):
-        return False, "Awaiting an owner's +1 reply in the risk assessment thread"
+        return False, AWAITING_ENDORSEMENT
     for finding in comments:
         if (
             finding["user"]["login"] == "claude[bot]"
@@ -343,13 +343,13 @@ def withdraw_approvals(path, reviews, bot, head, allowed, reason):
 
 def publish(repo, number, head, slug, conclusion, reason):
     external_id = f"flox-review-pr-{number}"
-    url = f"{repo}/commits/{head}/check-runs?check_name={urllib.parse.quote(CHECK_NAME)}&filter=all&per_page=100"
+    url = f"{repo}/commits/{head}/check-runs?filter=all&per_page=100"
     existing = next(
         (
             check
             for page in api(url, paginate=True)
             for check in page["check_runs"]
-            if check["app"]["slug"] == slug and check["external_id"] == external_id
+            if check["external_id"] == external_id and check["app"]["slug"] == slug
         ),
         None,
     )
@@ -357,25 +357,31 @@ def publish(repo, number, head, slug, conclusion, reason):
     def summary(job_url):
         return f"PR #{number} at `{head}`\n\n{reason}\n\n[Open the decision job log]({job_url})"
 
-    # Keep the link to the job that established this decision on repeated runs.
+    title = {
+        # TODO: Give pending Claude assessments and required independent reviews distinct titles.
+        "neutral": "Awaiting owner approval",
+        "success": "Owner review satisfied",
+        "failure": "Unable to evaluate owner review",
+    }[conclusion]
+    if reason == AWAITING_ENDORSEMENT:
+        title = "Awaiting author risk endorsement"
+
     if (
         existing
         and existing["conclusion"] == conclusion
         and existing["output"]["summary"] == summary(existing["details_url"])
     ):
-        return
-    job_url = os.environ["DECISION_JOB_URL"]
+        if existing["name"] == CHECK_NAME and existing["output"]["title"] == title:
+            return
+        # A display-only change keeps the log from the job that made the decision.
+        job_url = existing["details_url"]
+    else:
+        job_url = os.environ["DECISION_JOB_URL"]
     payload = {
+        "name": CHECK_NAME,
         "status": "completed",
         "conclusion": conclusion,
-        "output": {
-            "title": {
-                "neutral": "Awaiting owner approval",
-                "success": "Owner review satisfied",
-                "failure": "Unable to evaluate owner review",
-            }[conclusion],
-            "summary": summary(job_url),
-        },
+        "output": {"title": title, "summary": summary(job_url)},
         "details_url": job_url,
     }
     if existing:
@@ -385,7 +391,6 @@ def publish(repo, number, head, slug, conclusion, reason):
             f"{repo}/check-runs",
             payload={
                 **payload,
-                "name": CHECK_NAME,
                 "head_sha": head,
                 "external_id": external_id,
             },
